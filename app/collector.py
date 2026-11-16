@@ -2,21 +2,33 @@
 
 Correctness contract
 --------------------
-1. **Identity survives rename.**  A source file is identified by
-   ``(st_dev, st_ino)``.  When the gateway renames the live file and
-   creates a same-named new one, the old inode keeps being tracked under
-   its new path and any later backfill append is still ingested.
-2. **No partial lines.**  Only bytes up to the final newline are
+1. **Identity survives rename, not recreation.**  A source file is
+   identified via :mod:`app.fileid` (birth time / xattr token, plus
+   inode).  When the gateway renames the live file and creates a
+   same-named new one, the old inode keeps being tracked under its new
+   path and later backfill appends are still ingested.  If the old inode
+   is deleted and a new file reuses the same inode number or the same
+   path, it gets a different ``file_id`` and therefore a fresh 0 byte
+   offset: it never inherits the old position or merges with the old
+   source's rows.
+2. **One descriptor for identity and data.**  Identity is computed from
+   the descriptor that is also read, so a path swapped between the scan
+   and the read can never file a new file's bytes under the old identity.
+3. **No partial lines.**  Only bytes up to the final newline are
    consumed; an unterminated trailing record stays on disk and is picked
    up on a later scan.  Each file advances independently, so a fragment
    on one file never blocks another (e.g. the brand-new live file).
-3. **Progress commits with the data.**  Rows and the new read offset are
+4. **Progress commits with the data.**  Rows and the new read offset are
    written in one ``BEGIN IMMEDIATE`` transaction; on any read or write
    failure the offset is not advanced, and the next loop re-reads from
    the last committed position.  ``UNIQUE(file_id, byte_offset)`` plus a
    re-check of the committed offset make two collectors sharing the DB
    unable to double-insert a line, while identical content on different
    lines stays distinct.
+5. **Sealed files stay readable.**  Sealed sources are renamed into
+   ``shared/.reclaim/``; that directory is scanned too, so reads that
+   were in flight when the seal happened still complete and the reclaim
+   worker can verify every sealed byte before deleting the source.
 """
 from __future__ import annotations
 
@@ -29,17 +41,15 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import config, db
+from . import config, db, fileid
 
 log = logging.getLogger("collector")
+
+RECLAIM_SUBDIR = ".reclaim"
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-
-def file_identity(st: os.stat_result) -> str:
-    return f"dev{st.st_dev}-ino{st.st_ino}"
 
 
 class Collector:
@@ -89,7 +99,12 @@ class Collector:
             entries = sorted(self.shared_dir.glob("*.jsonl"))
         except OSError as exc:
             self.log_error("read", f"scan failed: {exc!r}")
-            return
+            entries = []
+        # Sealed sources live here; keep draining whatever is left in them.
+        try:
+            entries += sorted((self.shared_dir / RECLAIM_SUBDIR).glob("*.jsonl"))
+        except OSError as exc:
+            self.log_error("read", f"sealed-dir scan failed: {exc!r}")
 
         for path in entries:
             if self._stop:
@@ -106,54 +121,64 @@ class Collector:
         ).fetchone()
 
     def _process_file(self, path: Path) -> None:
+        # Open once and use this descriptor for identity, size and data.
+        # Re-stat'ing the path later could observe a different file after a
+        # rename/replace and mix two sources under one identity.
         try:
-            st = path.stat()
+            fh = open(path, "rb")
         except FileNotFoundError:
-            return  # renamed/removed between scan and stat; try next round
-        fid = file_identity(st)
-
-        # Register / refresh identity.  Committing the state row first is
-        # harmless: read_offset stays 0 until rows are committed too.
-        # INSERT OR IGNORE lets two collectors discover the same inode
-        # concurrently without either transaction aborting.
-        with db.transaction(self.conn) as tx:
-            tx.execute(
-                """INSERT OR IGNORE INTO file_states
-                       (file_id, inode, last_path, size_seen, read_offset,
-                        line_count, first_seen_utc, updated_utc)
-                   VALUES (?, ?, ?, 0, 0, 0, ?, ?)""",
-                (fid, st.st_ino, str(path), utc_now(), utc_now()),
-            )
-            state = self._get_state(tx, fid)
-            offset, line_count = state["read_offset"], state["line_count"]
-            if state["last_path"] != str(path):
-                tx.execute(
-                    "UPDATE file_states SET last_path = ?, updated_utc = ? WHERE file_id = ?",
-                    (str(path), utc_now(), fid),
-                )
-
-        # Truncation guard: the contract says files are never truncated,
-        # but do not silently skip data if it ever happens.
-        if st.st_size < offset:
-            self.log_error(
-                "read",
-                f"{path}: shrank from {offset} to {st.st_size} bytes; offset held",
-                file_id=fid, path=str(path),
-            )
+            return  # renamed/removed between scan and open; try next round
+        except OSError as exc:
+            self.log_error("read", f"{path}: {exc!r}", path=str(path))
             return
+        with fh:
+            try:
+                ident = fileid.identity_from_fd(fh.fileno())
+                st = os.fstat(fh.fileno())
+            except OSError as exc:
+                self.log_error("read", f"{path}: identity: {exc!r}",
+                               path=str(path))
+                return
+            fid = ident.file_id
 
-        if st.st_size == offset:
-            return  # nothing new
+            # Register / refresh identity.  Committing the state row first is
+            # harmless: read_offset stays 0 until rows are committed too.
+            # INSERT OR IGNORE lets two collectors discover the same inode
+            # concurrently without either transaction aborting.
+            try:
+                state = db.ensure_file_state(
+                    self.conn, file_id=fid, inode=ident.ino, path=str(path),
+                    dev=ident.dev, btime_ns=ident.btime_ns,
+                    token=ident.token,
+                )
+            except sqlite3.Error as exc:
+                self.log_error("db", f"{path}: identity: {exc!r}",
+                               file_id=fid, path=str(path))
+                return
+            offset = state["read_offset"]
+            line_count = state["line_count"]
 
-        # Read the uncommitted tail, accumulating chunks until at least one
-        # complete line (a newline) is available or EOF is reached.  A single
-        # record may span many READ_CHUNK reads; reading just one chunk and
-        # giving up when it has no newline would stall forever on a line
-        # longer than the chunk size.  A read failure leaves the committed
-        # offset untouched -> nothing is skipped.
-        buf = bytearray()
-        try:
-            with open(path, "rb") as fh:
+            # Truncation guard: the contract says files are never truncated,
+            # but do not silently skip data if it ever happens.
+            if st.st_size < offset:
+                self.log_error(
+                    "read",
+                    f"{path}: shrank from {offset} to {st.st_size} bytes; offset held",
+                    file_id=fid, path=str(path),
+                )
+                return
+
+            if st.st_size == offset:
+                return  # nothing new
+
+            # Read the uncommitted tail, accumulating chunks until at least
+            # one complete line (a newline) is available or EOF is reached.
+            # A single record may span many READ_CHUNK reads; reading just
+            # one chunk and giving up when it has no newline would stall
+            # forever on a line longer than the chunk size.  A read failure
+            # leaves the committed offset untouched -> nothing is skipped.
+            buf = bytearray()
+            try:
                 fh.seek(offset)
                 while True:
                     chunk = fh.read(config.READ_CHUNK)
@@ -170,9 +195,10 @@ class Collector:
                             file_id=fid, path=str(path),
                         )
                         return
-        except OSError as exc:
-            self.log_error("read", f"{path}: {exc!r}", file_id=fid, path=str(path))
-            return
+            except OSError as exc:
+                self.log_error("read", f"{path}: {exc!r}", file_id=fid,
+                               path=str(path))
+                return
 
         if not buf:
             return

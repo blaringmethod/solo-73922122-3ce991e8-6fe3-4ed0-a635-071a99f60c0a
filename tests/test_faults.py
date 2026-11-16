@@ -20,8 +20,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app import config, db  # noqa: E402
-from app.collector import Collector, file_identity  # noqa: E402
+from app.collector import Collector  # noqa: E402
 from app.gateway import append_alarm, append_raw  # noqa: E402
+from app.fileid import identity_from_path  # noqa: E402
+
+
+def current_fid(shared: Path) -> str:
+    """Identity of the live file (same helper the collector uses)."""
+    return identity_from_path(shared / config.CURRENT_FILE).file_id
 
 PASS = FAIL = 0
 
@@ -76,7 +82,7 @@ def main() -> int:
     c.scan()
     con2 = sqlite3.connect(dbp)
     rows_during_failure = con2.execute("SELECT COUNT(*) FROM alarms").fetchone()[0]
-    fid = file_identity((shared / config.CURRENT_FILE).stat())
+    fid = current_fid(shared)
     offset_during = con2.execute(
         "SELECT read_offset FROM file_states WHERE file_id=?", (fid,)
     ).fetchone()[0]
@@ -126,7 +132,7 @@ def main() -> int:
         time.sleep(0.05)
     n = sqlite3.connect(dbp2).execute("SELECT COUNT(*) FROM alarms").fetchone()[0]
     check("all 20 oversized lines ingested across chunks", n == 20, f"rows={n}")
-    fid2 = file_identity((shared2 / config.CURRENT_FILE).stat())
+    fid2 = current_fid(shared2)
     final_off = sqlite3.connect(dbp2).execute(
         "SELECT read_offset FROM file_states WHERE file_id=?", (fid2,)).fetchone()[0]
     size2 = (shared2 / config.CURRENT_FILE).stat().st_size
@@ -148,7 +154,7 @@ def main() -> int:
     c3.scan()
     n3 = sqlite3.connect(dbp3).execute("SELECT COUNT(*) FROM alarms").fetchone()[0]
     check("blank lines skipped, only real records stored", n3 == 2, f"rows={n3}")
-    fid3 = file_identity((shared3 / config.CURRENT_FILE).stat())
+    fid3 = current_fid(shared3)
     off3 = sqlite3.connect(dbp3).execute(
         "SELECT read_offset FROM file_states WHERE file_id=?", (fid3,)).fetchone()[0]
     size3 = (shared3 / config.CURRENT_FILE).stat().st_size
@@ -164,12 +170,13 @@ def main() -> int:
     c4.scan()
     live4 = shared4 / config.CURRENT_FILE
     append_alarm(device_id="d", alarm_code="R1")
+    # Capture the identity before permissions are revoked.
+    fid4 = current_fid(shared4)
     # Revoke read permission to force open()/read() to fail. Skip gracefully
     # where the sandbox lets root bypass permission bits.
     os.chmod(live4, 0o000)
     can_block = not os.access(live4, os.R_OK)
     if can_block:
-        fid4 = file_identity(live4.stat())
         off_before = sqlite3.connect(dbp4).execute(
             "SELECT read_offset FROM file_states WHERE file_id=?", (fid4,)).fetchone()[0]
         c4.scan()

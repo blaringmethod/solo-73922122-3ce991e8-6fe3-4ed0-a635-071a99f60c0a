@@ -3,6 +3,10 @@
 #   docker compose up --build
 #   open http://localhost:8000
 #
+# The web process also runs the seal-and-reclaim worker; collectors scan
+# both the live directory and .reclaim/ so reads in flight at seal time
+# still complete. Sealed files keep their slot until the unlink succeeds.
+#
 services:
   web:
     build: .
@@ -12,6 +16,9 @@ services:
       SHARED_DIR: /data/shared
       DB_PATH: /data/warehouse/alarms.db
       MAX_GENERATIONS: "3"
+      RECLAIM_POLL_SECONDS: "1"
+      RECLAIM_RETRY_SECONDS: "5"
+      TZ: "UTC"
     ports:
       - "8000:8000"
     volumes:

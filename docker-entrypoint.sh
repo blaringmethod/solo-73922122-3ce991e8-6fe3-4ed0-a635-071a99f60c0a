@@ -4,7 +4,10 @@
 #   collector  -> one collector process (COLLECTOR_ID set by compose)
 set -eu
 
-mkdir -p "${SHARED_DIR:-/data/shared}" "$(dirname "${DB_PATH:-/data/warehouse/alarms.db}")"
+SHARED_DIR="${SHARED_DIR:-/data/shared}"
+DB_PATH="${DB_PATH:-/data/warehouse/alarms.db}"
+
+mkdir -p "$SHARED_DIR" "$SHARED_DIR/.reclaim" "$(dirname "$DB_PATH")"
 
 case "${1:-web}" in
   web)

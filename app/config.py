@@ -1,5 +1,5 @@
-"""Runtime configuration, driven by environment variables so the same
-image can be used by the gateway / collector / web services."""
+"""Configuration, driven by environment variables so the same image can
+serve the gateway / collector / web roles."""
 from __future__ import annotations
 
 import os
@@ -15,7 +15,7 @@ DB_PATH = Path(os.getenv("DB_PATH", "/data/warehouse/alarms.db")).resolve()
 # File name the gateway is currently appending to.
 CURRENT_FILE = os.getenv("CURRENT_FILE", "alarms.jsonl")
 
-# Rotation keeps CURRENT_FILE + at most this many renamed old files.
+# Rotation keeps CURRENT_FILE + at most this many files in total.
 MAX_GENERATIONS = int(os.getenv("MAX_GENERATIONS", "3"))
 
 # Collector scan interval (seconds).
@@ -30,3 +30,9 @@ MAX_LINE_BYTES = int(os.getenv("MAX_LINE_BYTES", str(64 * 1024 * 1024)))
 
 # Stable identity of this collector process/instance.
 COLLECTOR_ID = os.getenv("COLLECTOR_ID", "collector-unknown")
+
+# Seal-and-reclaim: a sealed file may be deleted only once every byte of
+# the archive snapshot is in the warehouse (committed rows plus accepted
+# blank lines).  The worker retries deletion with backoff on failure.
+RECLAIM_RETRY_SECONDS = float(os.getenv("RECLAIM_RETRY_SECONDS", "5"))
+RECLAIM_POLL_SECONDS = float(os.getenv("RECLAIM_POLL_SECONDS", "1"))
